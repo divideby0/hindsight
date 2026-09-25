@@ -248,21 +248,25 @@ async def test_batch_resume_keeps_implicit_date_but_rejects_changed_context(monk
 
 
 @pytest.mark.asyncio
-async def test_disabling_lookback_refreshes_store_owned_document(monkeypatch) -> None:
+@pytest.mark.parametrize("params", [{"_retain_context_chars": 800}, {"context": "ordinary"}, {}, None])
+async def test_store_owned_delta_decodes_retain_params(monkeypatch, params) -> None:
     from hindsight_api.engine import memories
-    from hindsight_api.engine.retain.orchestrator import _try_delta_retain
+    from hindsight_api.engine.retain import orchestrator
+    from hindsight_api.engine.memories.base import document_record_metadata
 
     store = SimpleNamespace(
         store_owned_for=lambda bank_id: True,
         get_document_record=AsyncMock(
             return_value={
-                "metadata": {"retain_params": {"_retain_context_chars": 800}},
+                "metadata": document_record_metadata(params),
                 "chunk_hashes": [hashlib.sha256(b"unchanged").hexdigest()],
             }
         ),
     )
     monkeypatch.setattr(memories, "get_memories", lambda: store)
-    result = await _try_delta_retain(
+    metadata_only = AsyncMock(return_value=orchestrator.RetainBatchResult([[]], TokenUsage(), 0))
+    monkeypatch.setattr(orchestrator, "_delta_metadata_only", metadata_only)
+    result = await orchestrator._try_delta_retain(
         pool=None,
         embeddings_model=None,
         llm_config=None,
@@ -281,7 +285,12 @@ async def test_disabling_lookback_refreshes_store_owned_document(monkeypatch) ->
         schema=None,
         outbox_callback=None,
     )
-    assert result is None  # Full extraction, not metadata-only reuse.
+    if params and params.get("_retain_context_chars"):
+        assert result is None  # Disable transition must re-extract.
+        metadata_only.assert_not_awaited()
+    else:
+        assert result is metadata_only.return_value  # Ordinary retains still reuse unchanged chunks.
+        metadata_only.assert_awaited_once()
     store.get_document_record.assert_awaited_once_with(bank_id="bank", document_id="doc", include_text=False)
 
 

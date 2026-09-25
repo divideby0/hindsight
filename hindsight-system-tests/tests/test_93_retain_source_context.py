@@ -129,3 +129,52 @@ async def test_context_edits_append_and_disabling_refresh_the_decision(client, l
     other = await client.memory.list_memories(bank_id, document_id="other", limit=100)
     assert len(other.items) == 1
     assert "unresolved option 2" in other.items[0].text
+
+
+async def test_json_append_items_share_only_the_stored_base(client, llm, bank_id, settled) -> None:
+    await client.acreate_bank(bank_id=bank_id, name="Append isolation regression")
+    await client.banks.update_bank_config(bank_id, {"updates": {"retain_context_chars": 1200}})
+    llm.on_step("extract_facts").answers_with(answer_extraction)
+    llm.on_step("consolidate").returns(consolidation())
+
+    base = [{"role": "assistant", "content": "Option 2: Monday with Theo."}]
+    sibling = [{"role": "assistant", "content": "Option 2: Friday with Nia."}]
+    await client.aretain(bank_id=bank_id, content=json.dumps(base), document_id="chat")
+    await settled(bank_id)
+    before = len(llm.prompts_for("extract_facts"))
+    await client.memory.retain_memories(
+        bank_id,
+        {
+            "items": [
+                {
+                    "content": Content(actual_instance=json.dumps(item)),
+                    "document_id": "chat",
+                    "update_mode": "append",
+                }
+                for item in (sibling, [TARGET])
+            ],
+        },
+    )
+    await settled(bank_id)
+
+    prompts = llm.prompts_for("extract_facts")[before:]
+    target_prompts = [p for p in prompts if "Decision marker" in p.rsplit("\nContent:\n", 1)[-1]]
+    assert len(target_prompts) == 1
+    preceding, target = target_prompts[0].rsplit("\nContent:\n", 1)
+    assert "Monday with Theo" in preceding
+    assert "Friday with Nia" not in preceding
+    assert json.loads(target) == [TARGET]
+
+    memories = await client.memory.list_memories(bank_id, document_id="chat", limit=100)
+    decisions = [m.text for m in memories.items if "Mira approved" in m.text]
+    assert len(decisions) == 1
+    assert "Mira approved Monday with Theo." in decisions[0]
+    doc = await client.documents.get_document(bank_id, "chat")
+    assert json.loads(doc.original_text) == base + sibling + [TARGET]
+    chunks = await client.documents.list_document_chunks(bank_id, "chat")
+    assert chunks.total == 3
+    assert {c.chunk_index: json.loads(c.chunk_text) for c in chunks.items} == {
+        0: base,
+        1: sibling,
+        2: [TARGET],
+    }

@@ -1196,6 +1196,7 @@ async def _extract_and_embed(
     schema: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
     vlm_config: "LLMConfig | None" = None,
+    batch_checkpoint_key: str | None = None,
 ) -> _EmbeddedExtraction:
     """Shared pipeline: extract facts from contents and generate embeddings."""
     set_stage("retain.extract_and_embed")
@@ -1217,6 +1218,7 @@ async def _extract_and_embed(
         schema,
         attachment_loader=attachment_loader,
         vlm_config=vlm_config,
+        batch_checkpoint_key=batch_checkpoint_key,
     )
     extracted_facts, chunks, usage = extraction.facts, extraction.chunks, extraction.usage
     log_buffer.append(
@@ -1757,13 +1759,21 @@ async def retain_batch(
             if config.retain_context_chars:
                 from .source_context import extend_source_context
 
-                first["_previous_source"] = extend_source_context("", existing_text, config.retain_context_chars)
+                # Each incoming item may consult the stored base, never a sibling
+                # submitted alongside it. The JSON body merge below is storage-only.
+                for incoming in contents_dicts:
+                    incoming["_previous_source"] = extend_source_context("", existing_text, config.retain_context_chars)
             contents_dicts = [existing_content, *contents_dicts]
             # Collapse to the merged array when every part is one, so `original_text` stays valid
             # JSON (#2409). `merge_json_array_parts` is the same function the splitter predicts an
             # oversized append's body with, so the two cannot disagree about what this produces.
             _merged_text = merge_json_array_parts([_item.get("content", "") for _item in contents_dicts])
-            if _merged_text is not None:
+            merged_append_body: str | None = None
+            if _merged_text is not None and config.retain_context_chars and len(contents_dicts) > 2:
+                # Preserve extraction boundaries for independent incoming arrays.
+                # Storage still receives the same valid, merged JSON document.
+                merged_append_body = _merged_text
+            elif _merged_text is not None:
                 merged_item: RetainContentDict = {"content": _merged_text}
                 merged_filenames: dict[str, str] = {}
                 for _item in contents_dicts:
@@ -1792,6 +1802,12 @@ async def retain_batch(
             # instead of a silently truncated document (#3989).
             if full_document_body is not None:
                 assert_append_extends_stored_body(existing_text, full_document_body, document_id=effective_doc_id)
+            elif merged_append_body is not None:
+                # This body was constructed from the base above, unlike a caller's
+                # predicted oversized body. JSON array merging is not a byte-prefix
+                # append (the base's closing bracket moves), so do not apply that
+                # prediction guard to the body we just assembled ourselves.
+                full_document_body = merged_append_body
 
     # --- Stale-request check (best-effort, before LLM extraction) ---
     # If the document was already updated by a more recent retain (updated_at > our
@@ -2746,6 +2762,10 @@ async def _streaming_retain_batch(
                     schema,
                     attachment_loader=attachment_loader,
                     vlm_config=vlm_config,
+                    # Index is document-absolute even in a later internal slice.
+                    # Source/settings stay in the fingerprint, not the identity,
+                    # so changed prompts are rejected rather than submitted anew.
+                    batch_checkpoint_key=f"retain_batch:{build_chunk_id(bank_id, effective_doc_id, chunk_index_offset + global_idx)}",
                 )
             finally:
                 reset_call_metadata(meta_token)
@@ -3752,7 +3772,9 @@ async def _try_delta_retain(
             )
         # A store-owned bank has no SQL document row at the earlier reuse gate.
         # Its persisted marker must also force a refresh when lookback is disabled.
-        prior_params = ((record or {}).get("metadata") or {}).get("retain_params") or {}
+        from ..memories.base import document_retain_params
+
+        prior_params = document_retain_params(record)
         if prior_params.get("_retain_context_chars"):
             log_buffer.append("[delta] Prior extraction used source context — refreshing without lookback")
             return None

@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -2752,6 +2752,10 @@ async def _write_batch_extraction_errors(
         )
 
 
+class _BatchPromptMismatch(RuntimeError):
+    """A saved provider batch belongs to different extraction inputs."""
+
+
 async def extract_facts_from_contents_batch_api(
     contents: list[RetainContent],
     llm_config,
@@ -2759,6 +2763,7 @@ async def extract_facts_from_contents_batch_api(
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
+    batch_checkpoint_key: str | None = None,
 ) -> ExtractionResult:
     """
     Extract facts using LLM Batch API (OpenAI/Groq).
@@ -2773,6 +2778,7 @@ async def extract_facts_from_contents_batch_api(
         pool: Database connection pool (for storing batch state)
         operation_id: Async operation ID (for crash recovery)
         schema: Database schema (for multi-tenant support)
+        batch_checkpoint_key: Stable extraction identity within the operation (streaming chunk).
 
     Returns:
         An ExtractionResult carrying the facts, their chunk metadata, and token usage.
@@ -2809,6 +2815,26 @@ async def extract_facts_from_contents_batch_api(
             metadata = row["result_metadata"]
             if isinstance(metadata, str):
                 metadata = json.loads(metadata)
+            # Streaming calls share an operation, but each owns a different batch.
+            # Read only this extraction's checkpoint; sibling chunks may already
+            # have committed or still be polling when a worker restarts.
+            if batch_checkpoint_key is not None:
+                if (
+                    batch_checkpoint_key not in metadata
+                    and metadata.get("batch_id")
+                    and metadata.get("batch_context_fingerprint")
+                ):
+                    # A pre-upgrade checkpoint has no chunk identity. Let the
+                    # existing resume path prove ownership by its full prompt
+                    # fingerprint before polling. Copies keep its saved implicit
+                    # dates out of this extraction if it belongs to a sibling.
+                    try:
+                        return await extract_facts_from_contents_batch_api(
+                            [replace(item) for item in contents], llm_config, config, pool, operation_id, schema
+                        )
+                    except _BatchPromptMismatch:
+                        pass
+                metadata = metadata.get(batch_checkpoint_key) or {}
             batch_id = metadata.get("batch_id")
             if batch_id:
                 submitted_account = metadata.get("batch_account")
@@ -2928,7 +2954,7 @@ async def extract_facts_from_contents_batch_api(
         # current targets; fail explicitly instead of silently reusing them.
         context_fingerprint = hashlib.sha256(json.dumps(batch_requests, sort_keys=True).encode()).hexdigest()
         if batch_id and context_fingerprint != submitted_context_fingerprint:
-            raise RuntimeError("Cannot resume context-window extraction: batch prompts changed; retain again")
+            raise _BatchPromptMismatch("Cannot resume context-window extraction: batch prompts changed; retain again")
 
     # Step 2: Submit batch (skip if resuming)
     if not batch_id:
@@ -2957,6 +2983,11 @@ async def extract_facts_from_contents_batch_api(
                     if config.retain_context_chars and item.event_date_is_default and item.event_date is not None
                 },
             }
+
+            # Merge one top-level entry atomically. Replacing a shared nested map
+            # would lose sibling checkpoints when concurrent chunks submit.
+            if batch_checkpoint_key is not None:
+                batch_state = {batch_checkpoint_key: batch_state}
 
             # Update operation result_metadata
             from ..db_utils import acquire_with_retry
@@ -3413,6 +3444,7 @@ async def extract_facts_from_contents(
     schema: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
     vlm_config: "LLMConfig | None" = None,
+    batch_checkpoint_key: str | None = None,
 ) -> ExtractionResult:
     """
     Extract facts from multiple content items in parallel.
@@ -3448,7 +3480,9 @@ async def extract_facts_from_contents(
 
     # Route to batch API if enabled
     if config.retain_batch_enabled:
-        return await extract_facts_from_contents_batch_api(contents, llm_config, config, pool, operation_id, schema)
+        return await extract_facts_from_contents_batch_api(
+            contents, llm_config, config, pool, operation_id, schema, batch_checkpoint_key=batch_checkpoint_key
+        )
 
     extraction_prompt = _build_extraction_prompt_and_schema(config)
 
