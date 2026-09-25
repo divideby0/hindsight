@@ -399,7 +399,8 @@ input[type="datetime-local"]::-webkit-calendar-picker-indicator {
 /* Keep long answers readable while tables and code can use the card width.
    The typography plugin owns table spacing, borders and dark-mode colors. */
 .reflect-answer {
-  overflow-wrap: anywhere;
+  /* Wrap long prose without shrinking tables' intrinsic column widths. */
+  overflow-wrap: break-word;
 }
 
 .reflect-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {

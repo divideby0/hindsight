@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
@@ -43,6 +43,15 @@ import remarkGfm from "remark-gfm";
 type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 type ViewMode = "answer" | "trace" | "json";
 type BasedOnTab = "directives" | "mental_models" | "observations" | "world" | "experience";
+
+// Stable component identity preserves the table's scroll position when controls change.
+function ReflectMarkdownTable({ children }: { children?: ReactNode }) {
+  return (
+    <div className="overflow-x-auto">
+      <table>{children}</table>
+    </div>
+  );
+}
 
 export function ThinkView() {
   const t = useTranslations("thinkView");
@@ -443,13 +452,7 @@ export function ThinkView() {
                   <div className="reflect-answer prose prose-base max-w-none dark:prose-invert prose-headings:font-semibold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg">
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
-                      components={{
-                        table: ({ children }) => (
-                          <div className="overflow-x-auto">
-                            <table>{children}</table>
-                          </div>
-                        ),
-                      }}
+                      components={{ table: ReflectMarkdownTable }}
                     >
                       {result.text}
                     </ReactMarkdown>
