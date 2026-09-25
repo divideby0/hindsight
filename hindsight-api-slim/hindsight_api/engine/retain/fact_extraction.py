@@ -2992,7 +2992,10 @@ async def extract_facts_from_contents_batch_api(
             # Merge one top-level entry atomically. Replacing a shared nested map
             # would lose sibling checkpoints when concurrent chunks submit.
             if batch_checkpoint_key is not None:
-                batch_state = {batch_checkpoint_key: batch_state}
+                # Worker recovery needs an operation-level signal even when
+                # lookback is off. This marker is not a legacy batch_id: only
+                # the keyed checkpoint may identify this extraction's batch.
+                batch_state = {"provider_batch": True, batch_checkpoint_key: batch_state}
 
             # Update operation result_metadata
             from ..db_utils import acquire_with_retry

@@ -130,6 +130,45 @@ def test_oversized_slices_keep_context_without_storing_overlap() -> None:
         seen = extend_source_context(seen, item["content"], 400)
 
 
+@pytest.mark.parametrize("shape", ["text", "json"])
+@pytest.mark.parametrize("chunks_per_slice", [1, 2, 3])
+def test_internal_batching_preserves_native_source_windows(shape: str, chunks_per_slice: int) -> None:
+    from hindsight_api.engine.memory_engine import count_tokens
+
+    turns = [
+        "Option 2 means Monday with Theo. " + "alpha " * 10,
+        "A neutral paragraph. " + "beta " * 10,
+        "I select option 2. " + "gamma " * 10,
+    ]
+    text = (
+        turns[0] + "\n" * 300 + turns[1] + "\n\n" + turns[2]
+        if shape == "text"
+        else json.dumps([{"role": "user", "content": turn} for turn in turns])
+    )
+    native = fact_extraction.chunk_text(text, 100, structured_chunk_size=200)
+    assert len(native) == 3
+    parts = list(
+        _iter_raw_sub_batches(
+            [{"content": text, "document_id": "chat"}],
+            sum(count_tokens(chunk) for chunk in native[:chunks_per_slice]),
+            chunk_size=100,
+            structured_chunk_size=200,
+            max_attachments_per_chunk=8,
+            context_chars=250,
+        )
+    )
+    actual = []
+    for part in parts:
+        item = part.contents[0]
+        chunks = fact_extraction.chunk_text(item["content"], 100, structured_chunk_size=200)
+        assert part.chunk_count == len(chunks)
+        if part.full_document_body is not None:
+            assert part.full_document_body == text
+        actual.extend(contextual_chunks(chunks, 250, item.get("_previous_source", "")))
+    assert [chunk.text for chunk in actual] == native
+    assert actual == list(contextual_chunks(native, 250))
+
+
 def test_prompt_marks_supporting_source_separately() -> None:
     parts = fact_extraction.build_chunk_prompt_parts(
         config(), chunk="choose option 2", context="Mira is speaking", previous_source="Option 2: Friday / Nia"
@@ -251,8 +290,8 @@ async def test_batch_resume_keeps_implicit_date_but_rejects_changed_context(monk
 @pytest.mark.parametrize("params", [{"_retain_context_chars": 800}, {"context": "ordinary"}, {}, None])
 async def test_store_owned_delta_decodes_retain_params(monkeypatch, params) -> None:
     from hindsight_api.engine import memories
-    from hindsight_api.engine.retain import orchestrator
     from hindsight_api.engine.memories.base import document_record_metadata
+    from hindsight_api.engine.retain import orchestrator
 
     store = SimpleNamespace(
         store_owned_for=lambda bank_id: True,
