@@ -34,6 +34,7 @@ class BatchRun:
     facts: dict[tuple[str, str, int], list[str]] = field(default_factory=dict)
     first_committed: asyncio.Event = field(default_factory=asyncio.Event)
     crash: bool = True
+    unavailable_accounts: set[str] = field(default_factory=set)
 
     async def fetchrow(self, query: str, *args: object) -> dict[str, Any]:
         snapshot = copy.deepcopy(self.metadata)
@@ -126,12 +127,16 @@ async def stream(
         provider="openai",
         model="test",
         openai_service_tier=None,
-        batch_account_key="account",
+        batch_account_key="replacement" if state.unavailable_accounts else "account",
         submit_batch=state.submit_batch,
         get_batch_status=state.get_batch_status,
         retrieve_batch_results=state.retrieve_batch_results,
     )
-    llm = SimpleNamespace(batch_provider_impl=AsyncMock(return_value=impl))
+    llm = SimpleNamespace(
+        batch_provider_impl=AsyncMock(
+            side_effect=lambda account_key=None: None if account_key in state.unavailable_accounts else impl
+        )
+    )
     config = replace(
         HindsightConfig.from_env(),
         retain_context_chars=800,
@@ -224,3 +229,25 @@ async def test_streaming_context_batch_matches_legacy_checkpoint(batch_run: Batc
     await stream(batch_run, event_date=DATE.replace(day=25) if matches else DATE)
     assert len(batch_run.requests) == (2 if matches else 3)
     assert batch_run.facts == {("bank", "doc", 0): [CHUNKS[0]], ("bank", "doc", 1): [CHUNKS[1]]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [True, False])
+async def test_batch_account_guard_requires_checkpoint_ownership(batch_run: BatchRun, legacy: bool) -> None:
+    with pytest.raises(RuntimeError, match="worker interrupted"):
+        await stream(batch_run)
+    if legacy:
+        key_b = f"retain_batch:{build_chunk_id('bank', 'doc', 1)}"
+        batch_run.metadata = batch_run.metadata[key_b]
+    batch_run.crash = False
+    batch_run.unavailable_accounts.add("account")
+    if legacy:
+        # The shared checkpoint cannot be matched without its serving account.
+        # It must not stop a chunk whose ownership was never established.
+        await stream(batch_run)
+        assert len(batch_run.requests) == 4
+        assert batch_run.facts == {("bank", "doc", 0): [CHUNKS[0]], ("bank", "doc", 1): [CHUNKS[1]]}
+    else:
+        with pytest.raises(RuntimeError, match="submitted by the LLM member"):
+            await stream(batch_run)
+        assert len(batch_run.requests) == 2

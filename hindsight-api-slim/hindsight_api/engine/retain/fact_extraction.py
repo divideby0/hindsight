@@ -2828,12 +2828,17 @@ async def extract_facts_from_contents_batch_api(
                     # existing resume path prove ownership by its full prompt
                     # fingerprint before polling. Copies keep its saved implicit
                     # dates out of this extraction if it belongs to a sibling.
-                    try:
-                        return await extract_facts_from_contents_batch_api(
-                            [replace(item) for item in contents], llm_config, config, pool, operation_id, schema
-                        )
-                    except _BatchPromptMismatch:
-                        pass
+                    # An unavailable legacy account cannot establish ownership;
+                    # it must not block an unrelated chunk. Owned, keyed batches
+                    # still enforce their saved account below.
+                    legacy_impl = await llm_config.batch_provider_impl(account_key=metadata.get("batch_account"))
+                    if legacy_impl is not None:
+                        try:
+                            return await extract_facts_from_contents_batch_api(
+                                [replace(item) for item in contents], llm_config, config, pool, operation_id, schema
+                            )
+                        except _BatchPromptMismatch:
+                            pass
                 metadata = metadata.get(batch_checkpoint_key) or {}
             batch_id = metadata.get("batch_id")
             if batch_id:
