@@ -440,8 +440,19 @@ export function ThinkView() {
                   <CardTitle>{t("answerTitle")}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <div className="prose prose-sm max-w-none dark:prose-invert">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.text}</ReactMarkdown>
+                  <div className="reflect-answer prose prose-base max-w-none dark:prose-invert prose-headings:font-semibold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        table: ({ children }) => (
+                          <div className="overflow-x-auto">
+                            <table>{children}</table>
+                          </div>
+                        ),
+                      }}
+                    >
+                      {result.text}
+                    </ReactMarkdown>
                   </div>
                 </CardContent>
               </Card>
